@@ -4,10 +4,11 @@ from os import makedirs
 from threading import Event
 from mega import (MegaApi, MegaListener, MegaRequest, MegaTransfer, MegaError)
 
-from bot import LOGGER, MEGA_API_KEY, download_dict_lock, download_dict, MEGA_EMAIL_ID, MEGA_PASSWORD, STOP_DUPLICATE
-from bot.helper.telegram_helper.message_utils import sendMessage, sendStatusMessage, sendFile
+from bot import LOGGER, config_dict, download_dict_lock, download_dict, non_queued_dl, non_queued_up, queued_dl, queue_dict_lock
+from bot.helper.telegram_helper.message_utils import sendMessage, sendStatusMessage
 from bot.helper.ext_utils.bot_utils import get_mega_link_type
 from bot.helper.mirror_utils.status_utils.mega_download_status import MegaDownloadStatus
+from bot.helper.mirror_utils.status_utils.queue_status import QueueStatus
 from bot.helper.mirror_utils.upload_utils.gdriveTools import GoogleDriveHelper
 from bot.helper.ext_utils.fs_utils import get_base_name
 
@@ -130,13 +131,16 @@ class AsyncExecutor:
         self.continue_event.wait()
 
 
-def add_mega_download(mega_link: str, path: str, listener, name: str):
+def add_mega_download(mega_link, path, listener, name, from_queue=False):
+    MEGA_API_KEY = config_dict['MEGA_API_KEY']
+    MEGA_EMAIL_ID = config_dict['MEGA_EMAIL_ID']
+    MEGA_PASSWORD = config_dict['MEGA_PASSWORD']
     executor = AsyncExecutor()
     api = MegaApi(MEGA_API_KEY, None, None, 'mirror-leech-telegram-bot')
     folder_api = None
     mega_listener = MegaAppListener(executor.continue_event, listener)
     api.addListener(mega_listener)
-    if MEGA_EMAIL_ID is not None and MEGA_PASSWORD is not None:
+    if MEGA_EMAIL_ID and MEGA_PASSWORD:
         executor.do(api.login, (MEGA_EMAIL_ID, MEGA_PASSWORD))
     if get_mega_link_type(mega_link) == "file":
         executor.do(api.getPublicNode, (mega_link,))
@@ -153,7 +157,7 @@ def add_mega_download(mega_link: str, path: str, listener, name: str):
             folder_api.removeListener(mega_listener)
         return
     mname = name or node.getName()
-    if STOP_DUPLICATE and not listener.isLeech:
+    if config_dict['STOP_DUPLICATE'] and not listener.isLeech:
         LOGGER.info('Checking File/Folder if already in Drive')
         if listener.isZip:
             mname = f"{mname}.zip"
@@ -163,22 +167,49 @@ def add_mega_download(mega_link: str, path: str, listener, name: str):
             except:
                 mname = None
         if mname is not None:
-            cap, f_name = GoogleDriveHelper().drive_list(mname, True)
-            if cap:
-                cap = f"File/Folder is already available in Drive. Here are the search results:\n\n{cap}"
-                sendFile(listener.bot, listener.message, f_name, cap)
+            smsg, button = GoogleDriveHelper().drive_list(mname, True)
+            if smsg:
+                msg1 = "File/Folder is already available in Drive.\nHere are the search results:"
+                sendMessage(msg1, listener.bot, listener.message, button)
                 api.removeListener(mega_listener)
                 if folder_api is not None:
                     folder_api.removeListener(mega_listener)
                 return
-    with download_dict_lock:
-        download_dict[listener.uid] = MegaDownloadStatus(mega_listener, listener)
-    listener.onDownloadStart()
-    makedirs(path)
     gid = ''.join(SystemRandom().choices(ascii_letters + digits, k=8))
     mname = name or node.getName()
-    mega_listener.setValues(mname, api.getSize(node), gid)
-    sendStatusMessage(listener.message, listener.bot)
+    size = api.getSize(node)
+    all_limit = config_dict['QUEUE_ALL']
+    dl_limit = config_dict['QUEUE_DOWNLOAD']
+    if all_limit or dl_limit:
+        added_to_queue = False
+        with queue_dict_lock:
+            dl = len(non_queued_dl)
+            up = len(non_queued_up)
+            if (all_limit and dl + up >= all_limit and (not dl_limit or dl >= dl_limit)) or (dl_limit and dl >= dl_limit):
+                added_to_queue = True
+                queued_dl[listener.uid] = ['mega', mega_link, path, listener, name]
+        if added_to_queue:
+            LOGGER.info(f"Added to Queue/Download: {mname}")
+            with download_dict_lock:
+                download_dict[listener.uid] = QueueStatus(mname, size, gid, listener, 'Dl')
+            listener.onDownloadStart()
+            sendStatusMessage(listener.message, listener.bot)
+            api.removeListener(mega_listener)
+            if folder_api is not None:
+                folder_api.removeListener(mega_listener)
+            return
+    with download_dict_lock:
+        download_dict[listener.uid] = MegaDownloadStatus(mega_listener, listener)
+    with queue_dict_lock:
+        non_queued_dl.add(listener.uid)
+    makedirs(path)
+    mega_listener.setValues(mname, size, gid)
+    if not from_queue:
+        listener.onDownloadStart()
+        sendStatusMessage(listener.message, listener.bot)
+        LOGGER.info(f"Download from Mega: {mname}")
+    else:
+        LOGGER.info(f'Start Queued Download from Mega: {mname}')
     executor.do(api.startDownload, (node, path, name, None, False, None))
     api.removeListener(mega_listener)
     if folder_api is not None:

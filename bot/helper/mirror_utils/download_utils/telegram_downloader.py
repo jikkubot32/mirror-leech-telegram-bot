@@ -2,9 +2,10 @@ from logging import getLogger, WARNING
 from time import time
 from threading import RLock, Lock
 
-from bot import LOGGER, download_dict, download_dict_lock, STOP_DUPLICATE, app
+from bot import LOGGER, download_dict, download_dict_lock, app, config_dict, non_queued_dl, non_queued_up, queued_dl, queue_dict_lock
 from ..status_utils.telegram_download_status import TelegramDownloadStatus
-from bot.helper.telegram_helper.message_utils import sendStatusMessage, sendFile
+from bot.helper.mirror_utils.status_utils.queue_status import QueueStatus
+from bot.helper.telegram_helper.message_utils import sendStatusMessage, sendMessage
 from bot.helper.mirror_utils.upload_utils.gdriveTools import GoogleDriveHelper
 
 global_lock = Lock()
@@ -30,7 +31,7 @@ class TelegramDownloadHelper:
         with self.__resource_lock:
             return self.downloaded_bytes / (time() - self.__start_time)
 
-    def __onDownloadStart(self, name, size, file_id):
+    def __onDownloadStart(self, name, size, file_id, from_queue):
         with global_lock:
             GLOBAL_GID.add(file_id)
         with self.__resource_lock:
@@ -39,8 +40,14 @@ class TelegramDownloadHelper:
             self.__id = file_id
         with download_dict_lock:
             download_dict[self.__listener.uid] = TelegramDownloadStatus(self, self.__listener, self.__id)
-        self.__listener.onDownloadStart()
-        sendStatusMessage(self.__listener.message, self.__listener.bot)
+        with queue_dict_lock:
+            non_queued_dl.add(self.__listener.uid)
+        if not from_queue:
+            self.__listener.onDownloadStart()
+            sendStatusMessage(self.__listener.message, self.__listener.bot)
+            LOGGER.info(f'Download from Telegram: {name}')
+        else:
+            LOGGER.info(f'Start Queued Download from Telegram: {name}')
 
     def __onDownloadProgress(self, current, total):
         if self.__is_cancelled:
@@ -69,6 +76,9 @@ class TelegramDownloadHelper:
     def __download(self, message, path):
         try:
             download = message.download(file_name=path, progress=self.__onDownloadProgress)
+            if self.__is_cancelled:
+                self.__onDownloadError('Cancelled by user!')
+                return
         except Exception as e:
             LOGGER.error(str(e))
             return self.__onDownloadError(str(e))
@@ -77,7 +87,7 @@ class TelegramDownloadHelper:
         elif not self.__is_cancelled:
             self.__onDownloadError('Internal error occurred')
 
-    def add_download(self, message, path, filename):
+    def add_download(self, message, path, filename, from_queue=False):
         _dmsg = app.get_messages(message.chat.id, reply_to_message_ids=message.message_id)
         media = _dmsg.document or _dmsg.video or _dmsg.audio or None
         if media is not None:
@@ -90,17 +100,36 @@ class TelegramDownloadHelper:
                 name = filename
                 path = path + name
 
-            if download:
+            if from_queue or download:
                 size = media.file_size
-                if STOP_DUPLICATE and not self.__listener.isLeech:
+                gid = media.file_unique_id
+                if config_dict['STOP_DUPLICATE'] and not self.__listener.isLeech:
                     LOGGER.info('Checking File/Folder if already in Drive...')
-                    cap, f_name = GoogleDriveHelper().drive_list(name, True, True)
-                    if cap:
-                        cap = f"File/Folder is already available in Drive. Here are the search results:\n\n{cap}"
-                        sendFile(self.__listener.bot, self.__listener.message, f_name, cap)
+                    smsg, button = GoogleDriveHelper().drive_list(name, True, True)
+                    if smsg:
+                        msg = "File/Folder is already available in Drive.\nHere are the search results:"
+                        sendMessage(msg, self.__listener.bot, self.__listener.message, button)
                         return
-                self.__onDownloadStart(name, size, media.file_unique_id)
-                LOGGER.info(f'Downloading Telegram file with id: {media.file_unique_id}')
+                all_limit = config_dict['QUEUE_ALL']
+                dl_limit = config_dict['QUEUE_DOWNLOAD']
+                if all_limit or dl_limit:
+                    added_to_queue = False
+                    with queue_dict_lock:
+                        dl = len(non_queued_dl)
+                        up = len(non_queued_up)
+                        if (all_limit and dl + up >= all_limit and (not dl_limit or dl >= dl_limit)) or (dl_limit and dl >= dl_limit):
+                            added_to_queue = True
+                            queued_dl[self.__listener.uid] = ['tg', message, path, filename, self.__listener]
+                    if added_to_queue:
+                        LOGGER.info(f"Added to Queue/Download: {name}")
+                        with download_dict_lock:
+                            download_dict[self.__listener.uid] = QueueStatus(name, size, gid, self.__listener, 'Dl')
+                        self.__listener.onDownloadStart()
+                        sendStatusMessage(self.__listener.message, self.__listener.bot)
+                        with global_lock:
+                            GLOBAL_GID.add(gid)
+                        return
+                self.__onDownloadStart(name, size, gid, from_queue)
                 self.__download(_dmsg, path)
             else:
                 self.__onDownloadError('File already being downloaded!')
@@ -110,4 +139,3 @@ class TelegramDownloadHelper:
     def cancel_download(self):
         LOGGER.info(f'Cancelling download on user request: {self.__id}')
         self.__is_cancelled = True
-        self.__onDownloadError('Cancelled by user!')
